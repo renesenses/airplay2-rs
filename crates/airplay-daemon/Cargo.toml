@@ -1,0 +1,21 @@
+[package]
+name = "airplay-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "airplay-daemon"
+path = "src/main.rs"
+
+[dependencies]
+airplay-client = { path = "../airplay-client" }
+airplay-core = { path = "../airplay-core" }
+airplay-discovery = { path = "../airplay-discovery" }
+airplay-audio = { path = "../airplay-audio" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { version = "1" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
