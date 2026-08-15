@@ -14,6 +14,7 @@ use std::time::Duration;
 ///
 /// Also enlarges the kernel send buffer (SO_SNDBUF) to 1MB to prevent drops
 /// when bursting packets to multiple group devices simultaneously.
+#[cfg(unix)]
 fn set_socket_qos(socket: &UdpSocket) {
     use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -64,6 +65,35 @@ fn set_socket_qos(socket: &UdpSocket) {
         if ret != 0 {
             tracing::debug!("Failed to set SO_PRIORITY: errno={}", std::io::Error::last_os_error());
         }
+    }
+}
+
+/// Windows counterpart of [`set_socket_qos`].
+///
+/// Winsock is not the POSIX socket API: on `x86_64-pc-windows-msvc` the `libc`
+/// crate exposes neither `IPPROTO_IP`/`IP_TOS`/`SOL_SOCKET`/`SO_SNDBUF` nor
+/// `socklen_t`, its `setsockopt` takes `*const c_char` instead of
+/// `*const c_void`, and `UdpSocket` has no `as_raw_fd`. The POSIX version above
+/// therefore produced ten compile errors and took the whole `airplay-audio`
+/// crate — hence the daemon, hence AirPlay 2 — down on Windows.
+///
+/// `socket2` (already a dependency) sets the same two options portably. Both
+/// stay best-effort and non-fatal, exactly like the Unix path: they are
+/// throughput optimisations, not correctness requirements. `SO_PRIORITY` has no
+/// Windows equivalent and is Linux-only above, so it is simply absent here.
+#[cfg(windows)]
+fn set_socket_qos(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+
+    // IP_TOS = DSCP EF (0xB8). Microsoft documents that not every Windows
+    // version honours IP_TOS on UDP sockets, so a failure here is expected on
+    // some hosts and must stay non-fatal.
+    if let Err(e) = sock.set_tos(0xB8) {
+        tracing::debug!("Failed to set IP_TOS (DSCP EF): {}", e);
+    }
+
+    if let Err(e) = sock.set_send_buffer_size(1024 * 1024) {
+        tracing::debug!("Failed to set SO_SNDBUF: {}", e);
     }
 }
 
