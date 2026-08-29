@@ -20,6 +20,7 @@
 //!   {"event":"connected","device":"HomePod"}
 //!   {"event":"paired","device":"HomePod"}
 //!   {"event":"playing","position_s":1.0}
+//!   {"event":"paused"}
 //!   {"event":"stopped"}
 //!   {"event":"error","message":"..."}
 
@@ -304,6 +305,30 @@ async fn async_main() {
                         emit(ev);
                     }
                     Err(e) => emit(Event::error(&format!("play failed: {e}"))),
+                }
+            }
+
+            "pause" => {
+                let Some(conn) = connection.as_mut() else {
+                    emit(Event::error("not connected")); continue;
+                };
+                match conn.pause().await {
+                    Ok(()) => emit(Event::simple("paused")),
+                    Err(e) => emit(Event::error(&format!("pause failed: {e}"))),
+                }
+            }
+
+            "resume" => {
+                let Some(conn) = connection.as_mut() else {
+                    emit(Event::error("not connected")); continue;
+                };
+                match conn.resume().await {
+                    Ok(()) => {
+                        let mut ev = Event::simple("playing");
+                        ev.device = Some(device_name.clone());
+                        emit(ev);
+                    }
+                    Err(e) => emit(Event::error(&format!("resume failed: {e}"))),
                 }
             }
 
