@@ -97,6 +97,18 @@ impl PairSetup {
         self.transient_mode
     }
 
+    /// Name of a pair-setup step, as reported in a receiver error.
+    fn step_label(&self, message: &str) -> &'static str {
+        match (self.transient_mode, message) {
+            (true, "M2") => "transient pair-setup M2",
+            (true, "M4") => "transient pair-setup M4",
+            (true, _) => "transient pair-setup M6",
+            (false, "M2") => "pair-setup M2",
+            (false, "M4") => "pair-setup M4",
+            (false, _) => "pair-setup M6",
+        }
+    }
+
     /// Generate M1 request.
     ///
     /// M1: {Method=0x00, State=0x01}
@@ -152,10 +164,12 @@ impl PairSetup {
         })?;
 
         // Check for error
-        if let Some(_error_code) = tlv.error() {
+        if let Some(error_code) = tlv.error() {
             self.state = PairSetupState::Failed;
-            return Err(Error::Pairing(PairingError::Protocol(
-                "Server returned error in M2".to_string(),
+            return Err(Error::Pairing(PairingError::device_error(
+                self.step_label("M2"),
+                error_code,
+                tlv.retry_delay(),
             )));
         }
 
@@ -284,10 +298,12 @@ impl PairSetup {
         })?;
 
         // Check for error
-        if let Some(_error_code) = tlv.error() {
+        if let Some(error_code) = tlv.error() {
             self.state = PairSetupState::Failed;
-            return Err(Error::Pairing(PairingError::Protocol(
-                "Server returned error in M4 (wrong PIN?)".to_string(),
+            return Err(Error::Pairing(PairingError::device_error(
+                self.step_label("M4"),
+                error_code,
+                tlv.retry_delay(),
             )));
         }
 
@@ -485,10 +501,12 @@ impl PairSetup {
         })?;
 
         // Check for error
-        if let Some(_error_code) = tlv.error() {
+        if let Some(error_code) = tlv.error() {
             self.state = PairSetupState::Failed;
-            return Err(Error::Pairing(PairingError::Protocol(
-                "Server returned error in M6".to_string(),
+            return Err(Error::Pairing(PairingError::device_error(
+                self.step_label("M6"),
+                error_code,
+                tlv.retry_delay(),
             )));
         }
 
@@ -1345,6 +1363,43 @@ mod tests {
 
             let result = setup.process_m2(&m2);
             assert!(result.is_err());
+        }
+
+        /// #8347 — the receiver's TLV error code reaches the caller.
+        #[test]
+        fn tlv_error_code_is_kept() {
+            let mut setup = PairSetup::new("3939");
+            let _ = setup.generate_m1().unwrap();
+
+            let mut tlv = Tlv8::new();
+            tlv.set(TlvType::State, vec![0x02]);
+            tlv.set(TlvType::Error, vec![0x03]); // Backoff
+            tlv.set(TlvType::RetryDelay, vec![30]);
+            let err = setup.process_m2(&tlv.encode()).unwrap_err();
+            match err {
+                Error::Pairing(PairingError::DeviceError { step, code, name, retry_after }) => {
+                    assert_eq!(step, "pair-setup M2");
+                    assert_eq!(code, 3);
+                    assert_eq!(name, "backoff");
+                    assert_eq!(retry_after, Some(30));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn transient_tlv_error_names_the_step() {
+            let mut setup = PairSetup::new_transient();
+            let _ = setup.generate_m1().unwrap();
+
+            let mut tlv = Tlv8::new();
+            tlv.set(TlvType::State, vec![0x02]);
+            tlv.set(TlvType::Error, vec![0x02]);
+            let msg = setup.process_m2(&tlv.encode()).unwrap_err().to_string();
+            assert!(
+                msg.contains("receiver refused transient pair-setup M2: TLV error 2 (authentication)"),
+                "{msg}"
+            );
         }
     }
 

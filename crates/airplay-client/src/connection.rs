@@ -1,7 +1,7 @@
 //! Device connection management.
 
 use airplay_core::{Device, StreamConfig, error::Result};
-use airplay_core::error::{Error as CoreError, RtspError};
+use airplay_core::error::{Error as CoreError, PairingError, RtspError};
 use airplay_core::features::AuthMethod;
 use airplay_rtsp::{RtspConnection, RtspSession, SessionState, RtspRequest};
 use airplay_pairing::{PairingSession, PairVerify, PairSetup, ControllerIdentity};
@@ -40,6 +40,19 @@ fn generate_device_id() -> String {
     )
 }
 
+/// Environment variable naming the directory that holds saved pairing
+/// identities (`.airplay_sender_identity_<device>.json`).
+pub const IDENTITY_DIR_ENV: &str = "AIRPLAY2_IDENTITY_DIR";
+
+/// Keep a receiver's TLV refusal intact (its code tells a wrong PIN from a
+/// rate limit, #8347); wrap any other pairing failure as before.
+fn pairing_step_error(context: &str, e: CoreError) -> CoreError {
+    match e {
+        CoreError::Pairing(PairingError::DeviceError { .. }) => e,
+        other => RtspError::SetupFailed(format!("{}: {}", context, other)).into(),
+    }
+}
+
 /// Persisted sender identity for pair-verify after initial pair-setup.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistentIdentity {
@@ -54,9 +67,17 @@ struct PersistentIdentity {
 
 impl PersistentIdentity {
     /// Find identity file for a target device.
+    ///
+    /// The file lives in `$AIRPLAY2_IDENTITY_DIR` when that variable is set
+    /// (a music server points it at its data directory, #8347), otherwise in
+    /// the current directory as before.
     fn identity_file_for(target_device_id: &str) -> PathBuf {
         let suffix = target_device_id.replace(":", "").to_lowercase();
-        PathBuf::from(format!(".airplay_sender_identity_{}.json", suffix))
+        let name = format!(".airplay_sender_identity_{}.json", suffix);
+        match std::env::var_os(IDENTITY_DIR_ENV) {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir).join(name),
+            _ => PathBuf::from(name),
+        }
     }
 
     /// Load identity for a target device if it exists.
@@ -357,15 +378,9 @@ impl Connection {
     /// a one-time PIN from `/pair-pin-start`, but then allow pair-verify for
     /// subsequent connections.
     pub async fn connect_auto(device: Device, config: StreamConfig, fallback_pin: &str) -> Result<Self> {
-        // Check if we have a persisted identity for this device
-        let target_device_id = device.id.to_mac_string();
-        if let Some(persistent_id) = PersistentIdentity::load_for_device(&target_device_id) {
-            info!("Found persisted identity for {}, attempting pair-verify", target_device_id);
-            match Self::connect_with_pair_verify(device.clone(), config.clone(), &persistent_id).await {
-                Ok(conn) => {
-                    info!("Pair-verify successful");
-                    return Ok(conn);
-                }
+        if let Some(result) = Self::connect_with_saved_identity(device.clone(), config.clone()).await {
+            match result {
+                Ok(conn) => return Ok(conn),
                 Err(e) => {
                     warn!("Pair-verify failed: {}, falling back to transient pairing", e);
                 }
@@ -374,6 +389,25 @@ impl Connection {
 
         // Fall back to transient pairing
         Self::connect_with_pin(device, config, fallback_pin).await
+    }
+
+    /// Whether an identity saved by a previous pair-setup exists for `device_id`.
+    pub fn has_saved_identity(device_id: &str) -> bool {
+        PersistentIdentity::load_for_device(device_id).is_some()
+    }
+
+    /// Pair-verify with the identity saved by a previous pair-setup.
+    ///
+    /// Returns `None` when no identity is saved for this device.
+    pub async fn connect_with_saved_identity(device: Device, config: StreamConfig) -> Option<Result<Self>> {
+        let target_device_id = device.id.to_mac_string();
+        let persistent_id = PersistentIdentity::load_for_device(&target_device_id)?;
+        info!("Found persisted identity for {}, attempting pair-verify", target_device_id);
+        let result = Self::connect_with_pair_verify(device, config, &persistent_id).await;
+        if result.is_ok() {
+            info!("Pair-verify successful");
+        }
+        Some(result)
     }
 
     /// Create connection using pair-verify with a persisted identity.
@@ -442,7 +476,7 @@ impl Connection {
 
         // Process M2
         pair_verify.process_m2(m2_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-verify M2 processing failed: {}", e))
+            pairing_step_error("Pair-verify M2 processing failed", e)
         })?;
 
         // M3: Send our signature
@@ -459,7 +493,7 @@ impl Connection {
 
         // Process M4 and get session keys
         let session_keys = pair_verify.process_m4(m4_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-verify M4 processing failed: {}", e))
+            pairing_step_error("Pair-verify M4 processing failed", e)
         })?;
 
         info!("Pair-verify complete, establishing encrypted session");
@@ -578,7 +612,7 @@ impl Connection {
         debug!("Pair-setup M2: {} bytes", m2_body.len());
 
         pair_setup.process_m2(m2_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-setup M2 processing failed: {}", e))
+            pairing_step_error("Pair-setup M2 processing failed", e)
         })?;
 
         // M3: Send SRP public key and proof
@@ -592,7 +626,7 @@ impl Connection {
         debug!("Pair-setup M4: {} bytes", m4_body.len());
 
         pair_setup.process_m4(m4_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-setup M4 processing failed: {}", e))
+            pairing_step_error("Pair-setup M4 processing failed", e)
         })?;
 
         // M5: Send encrypted identity (normal mode - not transient)
@@ -606,7 +640,7 @@ impl Connection {
         debug!("Pair-setup M6: {} bytes", m6_body.len());
 
         let _shared_secret = pair_setup.process_m6(m6_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-setup M6 processing failed: {}", e))
+            pairing_step_error("Pair-setup M6 processing failed", e)
         })?;
 
         info!("HomeKit pair-setup complete (M1-M6)");
@@ -645,7 +679,7 @@ impl Connection {
 
         // Process M2
         pair_verify.process_m2(pv_m2_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-verify M2 processing failed: {}", e))
+            pairing_step_error("Pair-verify M2 processing failed", e)
         })?;
 
         // M3: Send our signature
@@ -660,7 +694,7 @@ impl Connection {
 
         // Process M4 and get session keys
         let session_keys = pair_verify.process_m4(pv_m4_body).map_err(|e| {
-            RtspError::SetupFailed(format!("Pair-verify M4 processing failed: {}", e))
+            pairing_step_error("Pair-verify M4 processing failed", e)
         })?;
 
         info!("Pair-verify complete, establishing encrypted session");

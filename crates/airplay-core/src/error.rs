@@ -87,6 +87,53 @@ pub enum PairingError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    /// The receiver answered a pairing step with a TLV8 `Error` item
+    /// (HomeKit Accessory Protocol, kTLVError_*). The code is kept so the
+    /// caller can tell a wrong code from a rate limit or a full peer list.
+    #[error("receiver refused {step}: TLV error {code} ({name}){}", retry_suffix(*retry_after))]
+    DeviceError {
+        /// Pairing step that received the error, e.g. "pair-setup M4".
+        step: &'static str,
+        /// Raw kTLVError code sent by the receiver.
+        code: u8,
+        /// HomeKit name of the code (see [`tlv_error_name`]).
+        name: &'static str,
+        /// kTLVType_RetryDelay, in seconds, when the receiver sent one.
+        retry_after: Option<u16>,
+    },
+}
+
+impl PairingError {
+    /// Build a [`PairingError::DeviceError`] from a receiver TLV error code.
+    pub fn device_error(step: &'static str, code: u8, retry_after: Option<u16>) -> Self {
+        PairingError::DeviceError { step, code, name: tlv_error_name(code), retry_after }
+    }
+}
+
+/// HomeKit Accessory Protocol name of a kTLVError code.
+///
+/// 1 unknown, 2 authentication (wrong code / proof refused), 3 backoff
+/// (too many attempts, wait), 4 max peers (pairing list full), 5 max tries,
+/// 6 unavailable (pairing not open), 7 busy (another pairing in progress).
+pub fn tlv_error_name(code: u8) -> &'static str {
+    match code {
+        0x01 => "unknown",
+        0x02 => "authentication",
+        0x03 => "backoff",
+        0x04 => "max peers",
+        0x05 => "max tries",
+        0x06 => "unavailable",
+        0x07 => "busy",
+        _ => "unrecognised code",
+    }
+}
+
+fn retry_suffix(retry_after: Option<u16>) -> String {
+    match retry_after {
+        Some(s) if s > 0 => format!(", retry after {s} s"),
+        _ => String::new(),
+    }
 }
 
 /// Errors during RTSP communication.
