@@ -57,7 +57,7 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()
         fs::create_dir_all(dir)?;
     }
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -71,11 +71,7 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
-        // On Windows, rename does not replace an existing file.
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+        // Replaces an existing file on Unix and on Windows alike.
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -2561,7 +2557,7 @@ mod identity_storage_tests_8347 {
         assert_eq!(loaded.ed25519_secret, id.ed25519_secret);
         assert_eq!(loaded.server_ltpk_array(), Some([7u8; 32]));
         let path = PersistentIdentity::identity_file_for("AA:BB:CC:00:11:22");
-        assert!(!path.with_file_name(".airplay_sender_identity_aabbcc001122.json.tmp").exists());
+        assert!(!path.with_file_name(format!(".airplay_sender_identity_aabbcc001122.json.{}.tmp", std::process::id())).exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
