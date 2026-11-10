@@ -97,15 +97,16 @@ impl PairSetup {
         self.transient_mode
     }
 
-    /// Name of a pair-setup step, as reported in a receiver error.
+    /// Name of a pair-setup step, as reported in a receiver error. Spelled
+    /// "Pair-setup M<n>" like the daemon's former messages, which Tune reads.
     fn step_label(&self, message: &str) -> &'static str {
         match (self.transient_mode, message) {
-            (true, "M2") => "transient pair-setup M2",
-            (true, "M4") => "transient pair-setup M4",
-            (true, _) => "transient pair-setup M6",
-            (false, "M2") => "pair-setup M2",
-            (false, "M4") => "pair-setup M4",
-            (false, _) => "pair-setup M6",
+            (true, "M2") => "Pair-setup M2 (transient)",
+            (true, "M4") => "Pair-setup M4 (transient)",
+            (true, _) => "Pair-setup M6 (transient)",
+            (false, "M2") => "Pair-setup M2",
+            (false, "M4") => "Pair-setup M4",
+            (false, _) => "Pair-setup M6",
         }
     }
 
@@ -1378,7 +1379,7 @@ mod tests {
             let err = setup.process_m2(&tlv.encode()).unwrap_err();
             match err {
                 Error::Pairing(PairingError::DeviceError { step, code, name, retry_after }) => {
-                    assert_eq!(step, "pair-setup M2");
+                    assert_eq!(step, "Pair-setup M2");
                     assert_eq!(code, 3);
                     assert_eq!(name, "backoff");
                     assert_eq!(retry_after, Some(30));
@@ -1397,7 +1398,7 @@ mod tests {
             tlv.set(TlvType::Error, vec![0x02]);
             let msg = setup.process_m2(&tlv.encode()).unwrap_err().to_string();
             assert!(
-                msg.contains("receiver refused transient pair-setup M2: TLV error 2 (authentication)"),
+                msg.contains("receiver refused Pair-setup M2 (transient): TLV error 2 (authentication)"),
                 "{msg}"
             );
         }

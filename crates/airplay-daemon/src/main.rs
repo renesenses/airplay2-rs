@@ -96,7 +96,7 @@ struct Event {
     tlv_error: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tlv_error_name: Option<String>,
-    /// Pairing step that was refused, e.g. "pair-setup M4".
+    /// Pairing step that was refused, e.g. "Pair-setup M4".
     #[serde(skip_serializing_if = "Option::is_none")]
     pairing_step: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,15 +201,18 @@ fn tlv_refusal(err: &CoreError) -> Option<(&'static str, u8, &'static str, Optio
 /// After `route` failed with `err`, may `connect` try the next route?
 ///
 /// A failed pair-verify (stale identity) always falls through. Otherwise
-/// stop when the receiver cannot be reached, or when it said that more
-/// attempts would make things worse: backoff (3), max peers (4),
-/// max tries (5), busy (7).
+/// stop only when the TCP connection could not be opened at all
+/// (`RtspConnection::connect` reports every such failure as
+/// `ConnectionRefused`), or when the receiver said that more attempts would
+/// make things worse: backoff (3), max peers (4), max tries (5), busy (7).
+/// A receiver that closes the socket or stays silent on the transient
+/// attempt still gets the former pair-setup: each route opens a new TCP
+/// connection.
 fn may_try_next_route(route: PairingRoute, err: &CoreError) -> bool {
     if route == PairingRoute::PairVerify {
         return true;
     }
     match err {
-        CoreError::Connection(_) | CoreError::Timeout => false,
         CoreError::Rtsp(RtspError::ConnectionRefused) => false,
         _ => !matches!(tlv_refusal(err), Some((_, 3 | 4 | 5 | 7, _, _))),
     }
@@ -615,22 +618,28 @@ mod tests {
 
     #[test]
     fn failed_pair_verify_always_falls_through() {
-        assert!(may_try_next_route(PairingRoute::PairVerify, &refusal("pair-verify M2", 2)));
-        assert!(may_try_next_route(PairingRoute::PairVerify, &refusal("pair-verify M4", 3)));
+        assert!(may_try_next_route(PairingRoute::PairVerify, &refusal("Pair-verify M2", 2)));
+        assert!(may_try_next_route(PairingRoute::PairVerify, &refusal("Pair-verify M4", 3)));
     }
 
     #[test]
     fn transient_refusal_falls_back_unless_retrying_hurts() {
         let t = PairingRoute::Transient;
-        assert!(may_try_next_route(t, &refusal("transient pair-setup M4", 1)));
-        assert!(may_try_next_route(t, &refusal("transient pair-setup M4", 2)));
-        assert!(may_try_next_route(t, &refusal("transient pair-setup M2", 6)));
+        assert!(may_try_next_route(t, &refusal("Pair-setup M4", 1)));
+        assert!(may_try_next_route(t, &refusal("Pair-setup M4", 2)));
+        assert!(may_try_next_route(t, &refusal("Pair-setup M2", 6)));
         for code in [3, 4, 5, 7] {
-            assert!(!may_try_next_route(t, &refusal("transient pair-setup M2", code)), "code {code}");
+            assert!(!may_try_next_route(t, &refusal("Pair-setup M2", code)), "code {code}");
         }
         assert!(may_try_next_route(t, &RtspError::UnexpectedStatus(470).into()));
         assert!(!may_try_next_route(t, &RtspError::ConnectionRefused.into()));
-        assert!(!may_try_next_route(t, &CoreError::Timeout));
+        // A receiver that drops or ignores the transient attempt (HKP=4)
+        // still gets the former pair-setup.
+        assert!(may_try_next_route(t, &CoreError::Timeout));
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(may_try_next_route(t, &CoreError::Connection(reset)));
+        let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert!(may_try_next_route(t, &CoreError::Connection(eof)));
     }
 
     #[test]
@@ -645,19 +654,19 @@ mod tests {
     #[test]
     fn connect_error_reports_every_route_and_the_last_refusal() {
         let failures = vec![
-            (PairingRoute::Transient, refusal("transient pair-setup M4", 2)),
-            (PairingRoute::LegacyPinPairing, PairingError::device_error("pair-setup M2", 3, Some(60)).into()),
+            (PairingRoute::Transient, refusal("Pair-setup M4", 2)),
+            (PairingRoute::LegacyPinPairing, PairingError::device_error("Pair-setup M2", 3, Some(60)).into()),
         ];
         let ev = connect_error_event(&failures);
         let json: serde_json::Value = serde_json::to_value(&ev).unwrap();
         let msg = json["message"].as_str().unwrap();
         assert!(msg.starts_with("connect failed: "), "{msg}");
-        assert!(msg.contains("transient pairing: Pairing error: receiver refused transient pair-setup M4: TLV error 2 (authentication)"), "{msg}");
-        assert!(msg.contains("pair-setup with 3939: Pairing error: receiver refused pair-setup M2: TLV error 3 (backoff), retry after 60 s"), "{msg}");
+        assert!(msg.contains("transient pairing: Pairing error: receiver refused Pair-setup M4: TLV error 2 (authentication)"), "{msg}");
+        assert!(msg.contains("pair-setup with 3939: Pairing error: receiver refused Pair-setup M2: TLV error 3 (backoff), retry after 60 s"), "{msg}");
         assert_eq!(json["event"], "error");
         assert_eq!(json["tlv_error"], 3);
         assert_eq!(json["tlv_error_name"], "backoff");
-        assert_eq!(json["pairing_step"], "pair-setup M2");
+        assert_eq!(json["pairing_step"], "Pair-setup M2");
         assert_eq!(json["retry_after_s"], 60);
     }
 

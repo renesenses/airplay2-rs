@@ -44,6 +44,46 @@ fn generate_device_id() -> String {
 /// identities (`.airplay_sender_identity_<device>.json`).
 pub const IDENTITY_DIR_ENV: &str = "AIRPLAY2_IDENTITY_DIR";
 
+/// The all-zero device id a caller sends when it does not know the receiver.
+fn is_placeholder_device_id(device_id: &str) -> bool {
+    device_id.chars().all(|c| c == '0' || c == ':')
+}
+
+/// Write `data` to `path` through a temporary file and a rename, creating
+/// the directory if needed; the file is readable by its owner only on Unix.
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)?;
+    }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        // On Windows, rename does not replace an existing file.
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Keep a receiver's TLV refusal intact (its code tells a wrong PIN from a
 /// rate limit, #8347); wrap any other pairing failure as before.
 fn pairing_step_error(context: &str, e: CoreError) -> CoreError {
@@ -80,8 +120,22 @@ impl PersistentIdentity {
         }
     }
 
+    /// Forget the identity saved for a target device (the receiver no
+    /// longer knows it).
+    fn remove_for_device(target_device_id: &str) {
+        let path = Self::identity_file_for(target_device_id);
+        match fs::remove_file(&path) {
+            Ok(()) => info!("Removed stale identity {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Failed to remove stale identity {}: {}", path.display(), e),
+        }
+    }
+
     /// Load identity for a target device if it exists.
     fn load_for_device(target_device_id: &str) -> Option<Self> {
+        if is_placeholder_device_id(target_device_id) {
+            return None;
+        }
         let path = Self::identity_file_for(target_device_id);
         if !path.exists() {
             return None;
@@ -138,11 +192,19 @@ impl PersistentIdentity {
     }
 
     /// Save identity for a target device.
+    ///
+    /// Never for the all-zero placeholder id: that file would be shared by
+    /// every receiver. Written to a temporary file then renamed (no half
+    /// file after a crash), owner-only on Unix (it holds the Ed25519 seed).
     fn save_for_device(&self, target_device_id: &str) -> bool {
+        if is_placeholder_device_id(target_device_id) {
+            debug!("No identity saved for placeholder device id {}", target_device_id);
+            return false;
+        }
         let path = Self::identity_file_for(target_device_id);
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                match fs::write(&path, json) {
+                match write_private_file(&path, json.as_bytes()) {
                     Ok(()) => {
                         info!("Saved identity to {}", path.display());
                         true
@@ -404,8 +466,15 @@ impl Connection {
         let persistent_id = PersistentIdentity::load_for_device(&target_device_id)?;
         info!("Found persisted identity for {}, attempting pair-verify", target_device_id);
         let result = Self::connect_with_pair_verify(device, config, &persistent_id).await;
-        if result.is_ok() {
-            info!("Pair-verify successful");
+        match &result {
+            Ok(_) => info!("Pair-verify successful"),
+            // Authentication refused: the receiver no longer knows this
+            // identity (reset, removed from its list). Forget it so the next
+            // connection does not try it again.
+            Err(CoreError::Pairing(PairingError::DeviceError { code: 2, .. })) => {
+                PersistentIdentity::remove_for_device(&target_device_id);
+            }
+            Err(_) => {}
         }
         Some(result)
     }
@@ -2442,5 +2511,78 @@ mod tests {
             let stopped = PlaybackState::Stopped;
             assert_eq!(stopped, PlaybackState::Stopped);
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_storage_tests_8347 {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `AIRPLAY2_IDENTITY_DIR` is process-wide: serialise the tests using it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("airplay2-identity-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn identity() -> PersistentIdentity {
+        let controller = ControllerIdentity::generate();
+        PersistentIdentity::from_controller(&controller, "AA:BB:CC:00:11:22", Some([7u8; 32]), None)
+    }
+
+    #[test]
+    fn identity_file_follows_env_dir_or_stays_relative() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("path");
+        std::env::set_var(IDENTITY_DIR_ENV, &dir);
+        assert_eq!(
+            PersistentIdentity::identity_file_for("AA:BB:CC:00:11:22"),
+            dir.join(".airplay_sender_identity_aabbcc001122.json")
+        );
+        std::env::set_var(IDENTITY_DIR_ENV, "");
+        assert_eq!(
+            PersistentIdentity::identity_file_for("AA:BB:CC:00:11:22"),
+            PathBuf::from(".airplay_sender_identity_aabbcc001122.json")
+        );
+        std::env::remove_var(IDENTITY_DIR_ENV);
+    }
+
+    #[test]
+    fn identity_round_trips_in_a_missing_dir_and_can_be_forgotten() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("roundtrip").join("nested");
+        std::env::set_var(IDENTITY_DIR_ENV, &dir);
+        let id = identity();
+        assert!(id.save_for_device("AA:BB:CC:00:11:22"));
+        let loaded = PersistentIdentity::load_for_device("AA:BB:CC:00:11:22").expect("saved identity");
+        assert_eq!(loaded.ed25519_secret, id.ed25519_secret);
+        assert_eq!(loaded.server_ltpk_array(), Some([7u8; 32]));
+        let path = PersistentIdentity::identity_file_for("AA:BB:CC:00:11:22");
+        assert!(!path.with_file_name(".airplay_sender_identity_aabbcc001122.json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(id.save_for_device("AA:BB:CC:00:11:22"), "overwrite works");
+        PersistentIdentity::remove_for_device("AA:BB:CC:00:11:22");
+        assert!(PersistentIdentity::load_for_device("AA:BB:CC:00:11:22").is_none());
+        std::env::remove_var(IDENTITY_DIR_ENV);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn placeholder_device_id_is_never_saved_nor_loaded() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("placeholder");
+        std::env::set_var(IDENTITY_DIR_ENV, &dir);
+        assert!(!identity().save_for_device("00:00:00:00:00:00"));
+        assert!(!dir.join(".airplay_sender_identity_000000000000.json").exists());
+        assert!(PersistentIdentity::load_for_device("00:00:00:00:00:00").is_none());
+        std::env::remove_var(IDENTITY_DIR_ENV);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

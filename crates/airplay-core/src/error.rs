@@ -93,7 +93,7 @@ pub enum PairingError {
     /// caller can tell a wrong code from a rate limit or a full peer list.
     #[error("receiver refused {step}: TLV error {code} ({name}){}", retry_suffix(*retry_after))]
     DeviceError {
-        /// Pairing step that received the error, e.g. "pair-setup M4".
+        /// Pairing step that received the error, e.g. "Pair-setup M4".
         step: &'static str,
         /// Raw kTLVError code sent by the receiver.
         code: u8,

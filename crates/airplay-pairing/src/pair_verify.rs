@@ -681,7 +681,7 @@ impl PairVerify {
         // Check for error
         if let Some(error_code) = tlv.error() {
             self.state = PairVerifyState::Failed;
-            return Err(PairingError::device_error("pair-verify M2", error_code, tlv.retry_delay()).into());
+            return Err(PairingError::device_error("Pair-verify M2", error_code, tlv.retry_delay()).into());
         }
 
         // Verify state
@@ -1034,7 +1034,7 @@ impl PairVerify {
         if let Some(error_code) = tlv.error() {
             self.state = PairVerifyState::Failed;
             eprintln!("  DEBUG: M4 rejected with error code: {}", error_code);
-            return Err(PairingError::device_error("pair-verify M4", error_code, tlv.retry_delay()).into());
+            return Err(PairingError::device_error("Pair-verify M4", error_code, tlv.retry_delay()).into());
         }
 
         // Verify state
@@ -1086,7 +1086,7 @@ impl PairVerify {
             if let Some(error_code) = tlv.error() {
                 self.state = PairVerifyState::Failed;
                 eprintln!("  DEBUG: M4 transient rejected with TLV8 error code: {}", error_code);
-                return Err(PairingError::device_error("pair-verify M4", error_code, tlv.retry_delay()).into());
+                return Err(PairingError::device_error("Pair-verify M4", error_code, tlv.retry_delay()).into());
             }
             if tlv.state() == Some(0x04) {
                 return self.derive_session_keys();
