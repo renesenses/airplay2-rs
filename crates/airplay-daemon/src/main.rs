@@ -7,6 +7,11 @@
 //!   {"cmd":"discover","timeout_s":5}
 //!   {"cmd":"pair_pin_start","ip":"192.168.1.37","port":7000}
 //!   {"cmd":"connect","ip":"192.168.1.37","port":7000,"pin":"1234"}
+//!     Without a pin (or with the default "3939"): pair-verify with the
+//!     identity saved for `device_id`, else transient pairing like an iPhone,
+//!     else HomeKit pair-setup with 3939 (the former behaviour). A pin typed
+//!     by the user goes straight to HomeKit pair-setup with that pin (#8347).
+//!     Saved identities live in $AIRPLAY2_IDENTITY_DIR (current dir if unset).
 //!   {"cmd":"play","path":"/path/to/file.flac"}
 //!   {"cmd":"pause"}
 //!   {"cmd":"resume"}
@@ -17,12 +22,15 @@
 //!
 //! Events (stdout, one JSON per line):
 //!   {"event":"device","name":"HomePod","ip":"...","port":7000,"airplay2":true}
-//!   {"event":"connected","device":"HomePod"}
+//!   {"event":"connected","device":"HomePod","auth":"transient"}
+//!     auth: "pair_verify" | "transient" | "pin_pairing"
 //!   {"event":"paired","device":"HomePod"}
 //!   {"event":"playing","position_s":1.0}
 //!   {"event":"paused"}
 //!   {"event":"stopped"}
 //!   {"event":"error","message":"..."}
+//!     A pairing refusal adds tlv_error (HomeKit kTLVError code),
+//!     tlv_error_name, pairing_step and, when sent, retry_after_s.
 
 use std::io::BufRead;
 use std::net::IpAddr;
@@ -34,6 +42,7 @@ use airplay_core::device::{Device, DeviceId};
 use airplay_core::features::Features;
 use airplay_core::stream::{StreamType, TimingProtocol, PtpMode};
 use airplay_core::{AudioFormat, StreamConfig, AudioCodec};
+use airplay_core::error::{Error as CoreError, PairingError, RtspError};
 use airplay_audio::AlacEncoder;
 use airplay_discovery::{Discovery, ServiceBrowser};
 use serde::{Deserialize, Serialize};
@@ -78,6 +87,20 @@ struct Event {
     state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     volume: Option<f64>,
+    // #8347 — additions only; Tune ignores fields it does not know.
+    /// How `connect` paired: "pair_verify", "transient" or "pin_pairing".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    /// kTLVError code sent by the receiver when it refused pairing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tlv_error: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tlv_error_name: Option<String>,
+    /// Pairing step that was refused, e.g. "Pair-setup M4".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_s: Option<u16>,
 }
 
 impl Event {
@@ -87,6 +110,8 @@ impl Event {
             name: None, ip: None, port: None, airplay2: None,
             device: None, message: None, position_s: None,
             model: None, state: None, volume: None,
+            auth: None, tlv_error: None, tlv_error_name: None,
+            pairing_step: None, retry_after_s: None,
         }
     }
 
@@ -94,6 +119,142 @@ impl Event {
         let mut e = Self::simple("error");
         e.message = Some(msg.into());
         e
+    }
+}
+
+/// PIN of HomeKit transient pairing, sent by Tune when the user typed nothing.
+const TRANSIENT_PIN: &str = "3939";
+
+/// One way of pairing with the receiver during `connect` (#8347).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairingRoute {
+    /// Pair-verify with the identity saved by an earlier pair-setup.
+    PairVerify,
+    /// HomeKit transient pair-setup with 3939, as an iPhone does.
+    Transient,
+    /// HomeKit pair-setup (M1-M6) with 3939: what the daemon always did
+    /// before #8347, kept as a last resort for receivers that only took it.
+    LegacyPinPairing,
+    /// HomeKit pair-setup with the code the user typed.
+    UserPinPairing,
+}
+
+impl PairingRoute {
+    /// Value of the `auth` field of the `connected` event.
+    fn auth(self) -> &'static str {
+        match self {
+            PairingRoute::PairVerify => "pair_verify",
+            PairingRoute::Transient => "transient",
+            PairingRoute::LegacyPinPairing | PairingRoute::UserPinPairing => "pin_pairing",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PairingRoute::PairVerify => "pair-verify",
+            PairingRoute::Transient => "transient pairing",
+            PairingRoute::LegacyPinPairing => "pair-setup with 3939",
+            PairingRoute::UserPinPairing => "pair-setup with the user code",
+        }
+    }
+}
+
+/// The code the user typed, if any. Tune sends "3939" when the user typed
+/// nothing, so neither an absent, empty nor "3939" pin counts as typed.
+fn user_pin(pin: Option<&str>) -> Option<&str> {
+    match pin.map(str::trim) {
+        Some(p) if !p.is_empty() && p != TRANSIENT_PIN => Some(p),
+        _ => None,
+    }
+}
+
+/// Is `device_id` a real receiver identifier? Saved identities are keyed on
+/// it, so the all-zero placeholder must never select one.
+fn device_id_is_known(device_id: &DeviceId) -> bool {
+    device_id.to_mac_string().replace(':', "").chars().any(|c| c != '0')
+}
+
+/// Routes `connect` tries, in order.
+fn plan_connect(user_pin: Option<&str>, device_id_known: bool, has_identity: bool) -> Vec<PairingRoute> {
+    if user_pin.is_some() {
+        return vec![PairingRoute::UserPinPairing];
+    }
+    let mut routes = Vec::with_capacity(3);
+    if device_id_known && has_identity {
+        routes.push(PairingRoute::PairVerify);
+    }
+    routes.push(PairingRoute::Transient);
+    routes.push(PairingRoute::LegacyPinPairing);
+    routes
+}
+
+/// The receiver's TLV refusal carried by `err`, if any.
+fn tlv_refusal(err: &CoreError) -> Option<(&'static str, u8, &'static str, Option<u16>)> {
+    match err {
+        CoreError::Pairing(PairingError::DeviceError { step, code, name, retry_after }) => {
+            Some((*step, *code, *name, *retry_after))
+        }
+        _ => None,
+    }
+}
+
+/// After `route` failed with `err`, may `connect` try the next route?
+///
+/// A failed pair-verify (stale identity) always falls through. Otherwise
+/// stop only when the TCP connection could not be opened at all
+/// (`RtspConnection::connect` reports every such failure as
+/// `ConnectionRefused`), or when the receiver said that more attempts would
+/// make things worse: backoff (3), max peers (4), max tries (5), busy (7).
+/// A receiver that closes the socket or stays silent on the transient
+/// attempt still gets the former pair-setup: each route opens a new TCP
+/// connection.
+fn may_try_next_route(route: PairingRoute, err: &CoreError) -> bool {
+    if route == PairingRoute::PairVerify {
+        return true;
+    }
+    match err {
+        CoreError::Rtsp(RtspError::ConnectionRefused) => false,
+        _ => !matches!(tlv_refusal(err), Some((_, 3 | 4 | 5 | 7, _, _))),
+    }
+}
+
+/// `error` event for a failed `connect`: the message lists every route
+/// tried; the TLV fields describe the receiver's last refusal.
+fn connect_error_event(failures: &[(PairingRoute, CoreError)]) -> Event {
+    let detail = failures
+        .iter()
+        .map(|(route, e)| format!("{}: {e}", route.label()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut ev = Event::error(&format!("connect failed: {detail}"));
+    if let Some((step, code, name, retry_after)) =
+        failures.iter().rev().find_map(|(_, e)| tlv_refusal(e))
+    {
+        ev.tlv_error = Some(code);
+        ev.tlv_error_name = Some(name.into());
+        ev.pairing_step = Some(step.into());
+        ev.retry_after_s = retry_after.filter(|s| *s > 0);
+    }
+    ev
+}
+
+async fn connect_by_route(
+    route: PairingRoute,
+    device: Device,
+    config: StreamConfig,
+    pin: Option<&str>,
+) -> Result<Connection, CoreError> {
+    match route {
+        PairingRoute::PairVerify => Connection::connect_with_saved_identity(device, config)
+            .await
+            .unwrap_or_else(|| Err(RtspError::SetupFailed("no saved identity".into()).into())),
+        PairingRoute::Transient => Connection::connect_with_pin(device, config, TRANSIENT_PIN).await,
+        PairingRoute::LegacyPinPairing => {
+            Connection::connect_with_pin_pairing(device, config, TRANSIENT_PIN).await
+        }
+        PairingRoute::UserPinPairing => {
+            Connection::connect_with_pin_pairing(device, config, pin.unwrap_or(TRANSIENT_PIN)).await
+        }
     }
 }
 
@@ -203,7 +364,7 @@ async fn async_main() {
                     Err(e) => { emit(Event::error(&format!("invalid ip: {e}"))); continue; }
                 };
                 let port = cmd.port.unwrap_or(7000);
-                let pin = cmd.pin.as_deref().unwrap_or("3939");
+                let typed_pin = user_pin(cmd.pin.as_deref());
                 let dev_id_str = cmd.device_id.as_deref().unwrap_or("00:00:00:00:00:00");
 
                 let features = Features::from_txt_value("0x4A7FCA00,0x3C354BD0").unwrap_or_default();
@@ -269,15 +430,41 @@ async fn async_main() {
                     asc,
                 };
 
-                match Connection::connect_with_pin_pairing(device, config, pin).await {
-                    Ok(conn) => {
+                let id_known = device_id_is_known(&device.id);
+                let has_identity = id_known
+                    && typed_pin.is_none()
+                    && Connection::has_saved_identity(&device.id.to_mac_string());
+                let routes = plan_connect(typed_pin, id_known, has_identity);
+
+                let mut failures: Vec<(PairingRoute, CoreError)> = Vec::new();
+                let mut connected = None;
+                for route in routes {
+                    match connect_by_route(route, device.clone(), config.clone(), typed_pin).await {
+                        Ok(conn) => {
+                            connected = Some((route, conn));
+                            break;
+                        }
+                        Err(e) => {
+                            let next = may_try_next_route(route, &e);
+                            tracing::warn!("connect: {} failed: {e}", route.label());
+                            failures.push((route, e));
+                            if !next {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                match connected {
+                    Some((route, conn)) => {
                         device_name = conn.device().name.clone();
                         connection = Some(conn);
                         let mut ev = Event::simple("connected");
                         ev.device = Some(device_name.clone());
+                        ev.auth = Some(route.auth().into());
                         emit(ev);
                     }
-                    Err(e) => emit(Event::error(&format!("connect failed: {e}"))),
+                    None => emit(connect_error_event(&failures)),
                 }
             }
 
@@ -377,5 +564,130 @@ async fn async_main() {
                 emit(Event::error(&format!("unknown command: {other}")));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(step: &'static str, code: u8) -> CoreError {
+        PairingError::device_error(step, code, None).into()
+    }
+
+    #[test]
+    fn default_pin_is_not_a_typed_code() {
+        assert_eq!(user_pin(None), None);
+        assert_eq!(user_pin(Some("")), None);
+        assert_eq!(user_pin(Some(" ")), None);
+        assert_eq!(user_pin(Some("3939")), None);
+        assert_eq!(user_pin(Some("1234")), Some("1234"));
+        assert_eq!(user_pin(Some(" 0042 ")), Some("0042"));
+    }
+
+    #[test]
+    fn typed_code_keeps_pin_pairing_only() {
+        assert_eq!(plan_connect(Some("1234"), true, true), vec![PairingRoute::UserPinPairing]);
+        assert_eq!(plan_connect(Some("1234"), false, false), vec![PairingRoute::UserPinPairing]);
+    }
+
+    #[test]
+    fn saved_identity_goes_first_to_pair_verify() {
+        assert_eq!(
+            plan_connect(None, true, true),
+            vec![PairingRoute::PairVerify, PairingRoute::Transient, PairingRoute::LegacyPinPairing]
+        );
+    }
+
+    #[test]
+    fn no_identity_starts_with_transient_like_an_iphone() {
+        assert_eq!(
+            plan_connect(None, true, false),
+            vec![PairingRoute::Transient, PairingRoute::LegacyPinPairing]
+        );
+    }
+
+    #[test]
+    fn placeholder_device_id_never_uses_a_saved_identity() {
+        let zero = DeviceId::from_mac_string("00:00:00:00:00:00").unwrap();
+        let real = DeviceId::from_mac_string("AA:BB:CC:00:11:22").unwrap();
+        assert!(!device_id_is_known(&zero));
+        assert!(device_id_is_known(&real));
+        assert_eq!(plan_connect(None, false, true)[0], PairingRoute::Transient);
+    }
+
+    #[test]
+    fn failed_pair_verify_always_falls_through() {
+        assert!(may_try_next_route(PairingRoute::PairVerify, &refusal("Pair-verify M2", 2)));
+        assert!(may_try_next_route(PairingRoute::PairVerify, &refusal("Pair-verify M4", 3)));
+    }
+
+    #[test]
+    fn transient_refusal_falls_back_unless_retrying_hurts() {
+        let t = PairingRoute::Transient;
+        assert!(may_try_next_route(t, &refusal("Pair-setup M4", 1)));
+        assert!(may_try_next_route(t, &refusal("Pair-setup M4", 2)));
+        assert!(may_try_next_route(t, &refusal("Pair-setup M2", 6)));
+        for code in [3, 4, 5, 7] {
+            assert!(!may_try_next_route(t, &refusal("Pair-setup M2", code)), "code {code}");
+        }
+        assert!(may_try_next_route(t, &RtspError::UnexpectedStatus(470).into()));
+        assert!(!may_try_next_route(t, &RtspError::ConnectionRefused.into()));
+        // A receiver that drops or ignores the transient attempt (HKP=4)
+        // still gets the former pair-setup.
+        assert!(may_try_next_route(t, &CoreError::Timeout));
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(may_try_next_route(t, &CoreError::Connection(reset)));
+        let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert!(may_try_next_route(t, &CoreError::Connection(eof)));
+    }
+
+    #[test]
+    fn tlv_codes_carry_their_homekit_meaning() {
+        let names: Vec<_> = (1..=8).map(airplay_core::error::tlv_error_name).collect();
+        assert_eq!(
+            names,
+            ["unknown", "authentication", "backoff", "max peers", "max tries", "unavailable", "busy", "unrecognised code"]
+        );
+    }
+
+    #[test]
+    fn connect_error_reports_every_route_and_the_last_refusal() {
+        let failures = vec![
+            (PairingRoute::Transient, refusal("Pair-setup M4", 2)),
+            (PairingRoute::LegacyPinPairing, PairingError::device_error("Pair-setup M2", 3, Some(60)).into()),
+        ];
+        let ev = connect_error_event(&failures);
+        let json: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let msg = json["message"].as_str().unwrap();
+        assert!(msg.starts_with("connect failed: "), "{msg}");
+        assert!(msg.contains("transient pairing: Pairing error: receiver refused Pair-setup M4: TLV error 2 (authentication)"), "{msg}");
+        assert!(msg.contains("pair-setup with 3939: Pairing error: receiver refused Pair-setup M2: TLV error 3 (backoff), retry after 60 s"), "{msg}");
+        assert_eq!(json["event"], "error");
+        assert_eq!(json["tlv_error"], 3);
+        assert_eq!(json["tlv_error_name"], "backoff");
+        assert_eq!(json["pairing_step"], "Pair-setup M2");
+        assert_eq!(json["retry_after_s"], 60);
+    }
+
+    #[test]
+    fn connect_error_without_refusal_adds_no_field() {
+        let ev = connect_error_event(&[(PairingRoute::Transient, RtspError::ConnectionRefused.into())]);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(json, r#"{"event":"error","message":"connect failed: transient pairing: RTSP error: Connection refused"}"#);
+    }
+
+    #[test]
+    fn connected_event_keeps_old_fields_and_adds_auth() {
+        let mut ev = Event::simple("connected");
+        ev.device = Some("Mania".into());
+        ev.auth = Some(PairingRoute::Transient.auth().into());
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"event":"connected","device":"Mania","auth":"transient"}"#
+        );
+        assert_eq!(PairingRoute::PairVerify.auth(), "pair_verify");
+        assert_eq!(PairingRoute::UserPinPairing.auth(), "pin_pairing");
+        assert_eq!(PairingRoute::LegacyPinPairing.auth(), "pin_pairing");
     }
 }
