@@ -1183,16 +1183,16 @@ impl Connection {
             tracing::info!("FLUSH sent before streaming");
         }
 
-        streamer.start(decoder).await?;
-
-        // RECORD was sent at the end of setup(), just update state
-        self.session.start_playing()?;
-
-        // Send SET_PARAMETER volume to ensure HomePod is not muted
+        // Apply the known volume before the first audio packet.
         tracing::info!("Sending SET_PARAMETER volume");
         if let Err(e) = self.set_volume(self.volume).await {
             tracing::warn!("Failed to set volume: {}", e);
         }
+
+        streamer.start(decoder).await?;
+
+        // RECORD was sent at the end of setup(), just update state
+        self.session.start_playing()?;
 
         // Spawn control channel on a dedicated blocking thread for low-latency
         // retransmit handling. Uses 5ms recv timeout (well under HomePod's 70ms buffer)
@@ -1348,16 +1348,16 @@ impl Connection {
             tracing::info!("FLUSH sent before live streaming");
         }
 
-        // Start live streaming
-        streamer.start_live(live_decoder).await?;
-
-        self.session.start_playing()?;
-
-        // Set volume
+        // Apply the known volume before the first audio packet.
         tracing::info!("Sending SET_PARAMETER volume");
         if let Err(e) = self.set_volume(self.volume).await {
             tracing::warn!("Failed to set volume: {}", e);
         }
+
+        // Start live streaming
+        streamer.start_live(live_decoder).await?;
+
+        self.session.start_playing()?;
 
         // Spawn control channel for retransmit handling
         let control_task = if let Some(ref control_rx) = self.control_receiver {
@@ -2582,3 +2582,7 @@ mod identity_storage_tests_8347 {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "volume_avant_flux_8933_tests.rs"]
+mod volume_avant_flux_8933_tests;
