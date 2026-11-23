@@ -258,6 +258,30 @@ async fn connect_by_route(
     }
 }
 
+/// `POST /pair-pin-start`: asks the receiver to show its one-time code.
+///
+/// Sent like pyatv (`AirPlayHapPairSetupProcedure.start_pairing`) and owntone
+/// (`payload_make_pin_start`): `X-Apple-HKP: 3` announces a HomeKit normal
+/// pairing, the one that `connect` with the typed code then runs (M1-M6).
+/// A bare request (no HKP, no AirPlay User-Agent, no Content-Length) left
+/// an Apple TV 4 on tvOS 27.2.1 without any code on screen
+/// (tune-server-rust#9379).
+async fn pair_pin_start(ip: &str, port: u16) -> Result<reqwest::StatusCode, reqwest::Error> {
+    let url = format!("http://{}:{}/pair-pin-start", ip, port);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("User-Agent", "AirPlay/745.83")
+        .header("Connection", "keep-alive")
+        .header("X-Apple-HKP", "3")
+        .header("Content-Type", "application/octet-stream")
+        // hyper n'écrit pas de Content-Length pour un corps vide.
+        .header("Content-Length", "0")
+        .body(Vec::<u8>::new())
+        .send()
+        .await?;
+    Ok(resp.status())
+}
+
 fn emit(event: Event) {
     if let Ok(json) = serde_json::to_string(&event) {
         println!("{json}");
@@ -343,14 +367,13 @@ async fn async_main() {
                     emit(Event::error("ip required")); continue;
                 };
                 let port = cmd.port.unwrap_or(7000);
-                let url = format!("http://{}:{}/pair-pin-start", ip, port);
-                match reqwest::Client::new().post(&url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
+                match pair_pin_start(ip, port).await {
+                    Ok(status) if status.is_success() => {
                         let mut ev = Event::simple("pin_requested");
                         ev.ip = Some(ip.clone());
                         emit(ev);
                     }
-                    Ok(resp) => emit(Event::error(&format!("pair-pin-start: HTTP {}", resp.status()))),
+                    Ok(status) => emit(Event::error(&format!("pair-pin-start: HTTP {status}"))),
                     Err(e) => emit(Event::error(&format!("pair-pin-start failed: {e}"))),
                 }
             }
@@ -689,5 +712,36 @@ mod tests {
         assert_eq!(PairingRoute::PairVerify.auth(), "pair_verify");
         assert_eq!(PairingRoute::UserPinPairing.auth(), "pin_pairing");
         assert_eq!(PairingRoute::LegacyPinPairing.auth(), "pin_pairing");
+    }
+
+    /// tune-server-rust#9379 — Apple TV 4 (tvOS 27.2.1): « Pair » showed no
+    /// code. pyatv (`AirPlayHapPairSetupProcedure.start_pairing`) and owntone
+    /// (`payload_make_pin_start`) both send `/pair-pin-start` with
+    /// `X-Apple-HKP: 3` (HomeKit normal pairing) and an AirPlay User-Agent.
+    #[tokio::test]
+    async fn pair_pin_start_announces_homekit_normal_pairing_9379() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let receiver = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut req = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 { break; }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            String::from_utf8_lossy(&req).to_ascii_lowercase()
+        });
+        let status = pair_pin_start("127.0.0.1", port).await.unwrap();
+        assert!(status.is_success());
+        let req = receiver.await.unwrap();
+        assert!(req.starts_with("post /pair-pin-start "), "{req}");
+        assert!(req.contains("\r\nx-apple-hkp: 3\r\n"), "no X-Apple-HKP: 3 in {req}");
+        assert!(req.contains("\r\nuser-agent: airplay/"), "no AirPlay User-Agent in {req}");
+        assert!(req.contains("\r\ncontent-type: application/octet-stream\r\n"), "{req}");
+        assert!(req.contains("\r\ncontent-length: 0\r\n"), "{req}");
     }
 }
