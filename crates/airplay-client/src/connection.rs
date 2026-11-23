@@ -82,6 +82,36 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()
 
 /// Keep a receiver's TLV refusal intact (its code tells a wrong PIN from a
 /// rate limit, #8347); wrap any other pairing failure as before.
+/// Body of a pair-setup response, or an error that names its HTTP status
+/// (tune-server-rust#9379).
+///
+/// `RtspConnection::send` returns every response, whatever its status. A
+/// receiver that refused the request outright (HTTP 403, 470...) with an
+/// empty body was then read as an empty TLV, and the error said "M2 has
+/// wrong state value": the real answer was lost. A refusal that carries a
+/// HomeKit TLV error keeps its former path, which reports the kTLVError code.
+pub(crate) fn pair_setup_body<'a>(
+    response: &'a airplay_rtsp::RtspResponse,
+    step: &str,
+) -> Result<&'a [u8]> {
+    let body = response.body.as_deref().unwrap_or(&[]);
+    if (200..300).contains(&response.status_code) {
+        return Ok(body);
+    }
+    let tlv_error = airplay_crypto::Tlv8::parse(body)
+        .ok()
+        .and_then(|tlv| tlv.error());
+    if tlv_error.is_some() {
+        return Ok(body);
+    }
+    Err(CoreError::Pairing(PairingError::Protocol(format!(
+        "{step}: receiver answered HTTP {} {} ({} byte body)",
+        response.status_code,
+        response.status_text.trim(),
+        body.len()
+    ))))
+}
+
 fn pairing_step_error(context: &str, e: CoreError) -> CoreError {
     match e {
         CoreError::Pairing(PairingError::DeviceError { .. }) => e,
@@ -358,13 +388,13 @@ impl Connection {
         let pair_setup_req = RtspRequest::pair_setup(m1, &client_device_id, 4);
         let m2_resp = rtsp.send(pair_setup_req).await?;
 
-        let m2_body = m2_resp.body.as_deref().unwrap_or(&[]);
+        let m2_body = pair_setup_body(&m2_resp, "Pair-setup M1 (transient)")?;
         let m3 = pairing.continue_transient_pairing(m2_body)?;
 
         if let Some(m3_data) = m3 {
             let pair_setup_req = RtspRequest::pair_setup(m3_data, &client_device_id, 4);
             let m4_resp = rtsp.send(pair_setup_req).await?;
-            let m4_body = m4_resp.body.as_deref().unwrap_or(&[]);
+            let m4_body = pair_setup_body(&m4_resp, "Pair-setup M3 (transient)")?;
             pairing.continue_transient_pairing(m4_body)?;
         }
 
@@ -673,7 +703,7 @@ impl Connection {
         debug!("Pair-setup M1: {} bytes", m1.len());
 
         let m2_resp = rtsp.send(RtspRequest::pair_setup(m1, &client_device_id, 3)).await?;
-        let m2_body = m2_resp.body.as_deref().unwrap_or(&[]);
+        let m2_body = pair_setup_body(&m2_resp, "Pair-setup M1")?;
         debug!("Pair-setup M2: {} bytes", m2_body.len());
 
         pair_setup.process_m2(m2_body).map_err(|e| {
@@ -687,7 +717,7 @@ impl Connection {
         debug!("Pair-setup M3: {} bytes", m3.len());
 
         let m4_resp = rtsp.send(RtspRequest::pair_setup(m3, &client_device_id, 3)).await?;
-        let m4_body = m4_resp.body.as_deref().unwrap_or(&[]);
+        let m4_body = pair_setup_body(&m4_resp, "Pair-setup M3")?;
         debug!("Pair-setup M4: {} bytes", m4_body.len());
 
         pair_setup.process_m4(m4_body).map_err(|e| {
@@ -701,7 +731,7 @@ impl Connection {
         debug!("Pair-setup M5: {} bytes", m5.len());
 
         let m6_resp = rtsp.send(RtspRequest::pair_setup(m5, &client_device_id, 3)).await?;
-        let m6_body = m6_resp.body.as_deref().unwrap_or(&[]);
+        let m6_body = pair_setup_body(&m6_resp, "Pair-setup M5")?;
         debug!("Pair-setup M6: {} bytes", m6_body.len());
 
         let _shared_secret = pair_setup.process_m6(m6_body).map_err(|e| {
@@ -2586,3 +2616,49 @@ mod identity_storage_tests_8347 {
 #[cfg(test)]
 #[path = "volume_avant_flux_8933_tests.rs"]
 mod volume_avant_flux_8933_tests;
+
+#[cfg(test)]
+mod pair_setup_status_tests_9379 {
+    use super::*;
+    use airplay_rtsp::RtspResponse;
+
+    fn response(status_line: &str, body: &[u8]) -> RtspResponse {
+        let mut wire = format!(
+            "RTSP/1.0 {status_line}\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(body);
+        RtspResponse::parse(&wire).expect("valid response")
+    }
+
+    /// tune-server-rust#9379: an Apple TV that refuses pair-setup outright
+    /// answers a status with no TLV. The error must name that status, not
+    /// "M2 has wrong state value".
+    #[test]
+    fn a_refusal_without_tlv_names_the_http_status() {
+        let resp = response("470 Connection Authorization Required", b"");
+        let err = pair_setup_body(&resp, "Pair-setup M1 (transient)").unwrap_err().to_string();
+        assert!(err.contains("Pair-setup M1 (transient)"), "{err}");
+        assert!(err.contains("HTTP 470 Connection Authorization Required"), "{err}");
+        assert!(!err.contains("wrong state value"), "{err}");
+    }
+
+    /// A refusal that carries a HomeKit TLV error keeps the former path,
+    /// which reports the kTLVError code (Tune reads it, #8347).
+    #[test]
+    fn a_refusal_with_a_tlv_error_keeps_its_body() {
+        let mut tlv = airplay_crypto::Tlv8::new();
+        tlv.set(airplay_crypto::TlvType::State, vec![0x02]);
+        tlv.set(airplay_crypto::TlvType::Error, vec![0x02]);
+        let body = tlv.encode();
+        let resp = response("403 Forbidden", &body);
+        assert_eq!(pair_setup_body(&resp, "Pair-setup M1").unwrap(), body.as_slice());
+    }
+
+    #[test]
+    fn a_success_returns_its_body() {
+        let resp = response("200 OK", &[0x06, 0x01, 0x02]);
+        assert_eq!(pair_setup_body(&resp, "Pair-setup M1").unwrap(), &[0x06, 0x01, 0x02]);
+    }
+}
